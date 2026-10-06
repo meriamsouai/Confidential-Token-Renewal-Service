@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "confstr"
+version = "0.1.0"
+description = "Confidential token exchange CLI for CI/CD runners"
+requires-python = ">=3.11"
+dependencies = [
+    "click>=8.1",
+    "httpx>=0.28",
+    "python-dotenv>=1.0",
+]
+
+[project.scripts]
+confstr = "confstr.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

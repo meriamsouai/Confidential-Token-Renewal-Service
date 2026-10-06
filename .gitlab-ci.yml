@@ -1,3 +1,0 @@
-test:
-  script:
-    - echo "Hello from GitLab Runner"
