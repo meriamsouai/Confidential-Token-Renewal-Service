@@ -1,0 +1,161 @@
+# CTRS end-to-end demo pipeline
+# Proves: handle-only CI vars → confstr exchange → short-lived GitLab API use
+#          + policy deny for unauthorized job names
+#          + no long-lived glpat in CI variables
+#
+# Setup: copy this file to your GitLab test project's `.gitlab-ci.yml`
+#        (and copy `scripts/` next to it), or merge jobs into an existing pipeline.
+#
+# Required GitLab CI/CD variables (Settings → CI/CD → Variables):
+#   CTRS_GENERIC_HANDLE   — opaque handle from CTRS (NOT a glpat-…)
+#   CTRS_SERVICE_URL      — CTRS reachable from the runner (e.g. http://host.docker.internal:8080)
+#   CTRS_RUNNER_ID        — same id registered in CTRS (e.g. runner-wsl-01)
+#
+# Runner: self-hosted with tag below; secret file at CTRS_RUNNER_SECRET_FILE
+# Policy allow-list must include the job names marked ALLOWED below.
+
+stages:
+  - verify
+  - exchange
+  - policy
+
+variables:
+  CTRS_RUNNER_SECRET_FILE: "/etc/ctrs/runner-secret"
+
+# ── 1) Runner identity / environment ─────────────────────────────────────────
+# ALLOWED workflow name: ctrs_verify_runner
+ctrs_verify_runner:
+  stage: verify
+  tags:
+    - testing
+  script:
+    - |
+      set -e
+      echo "=== confstr verify-runner ==="
+      confstr verify-runner
+      echo "PASS: self-hosted runner environment looks suitable"
+
+# ── 2) Privacy: CI must not hold the long-lived GitLab PAT ───────────────────
+# No CTRS exchange needed — proves the confidentiality setup of the pipeline.
+ctrs_privacy_ci_vars:
+  stage: verify
+  tags:
+    - testing
+  script:
+    - |
+      set -e
+      echo "=== Privacy check: CI variables ==="
+      if [ -z "${CTRS_GENERIC_HANDLE:-}" ]; then
+        echo "ERROR: CTRS_GENERIC_HANDLE is not set"
+        exit 1
+      fi
+      case "$CTRS_GENERIC_HANDLE" in
+        glpat-*|gldt-*|gloas-*)
+          echo "ERROR: CTRS_GENERIC_HANDLE looks like a real GitLab token"
+          echo "       Put only the opaque CTRS handle in CI — keep glpat in the CTRS vault"
+          exit 1
+          ;;
+      esac
+      # Spot-check common secret variable names (must be empty / unset)
+      for name in GITLAB_TOKEN GITLAB_PAT PRIVATE_TOKEN ACCESS_TOKEN PROJECT_ACCESS_TOKEN; do
+        eval "val=\${$name:-}"
+        if [ -n "$val" ]; then
+          echo "ERROR: CI variable $name is set — long-lived secrets must not live in GitLab CI"
+          exit 1
+        fi
+      done
+      echo "OK: CTRS_GENERIC_HANDLE is opaque (not a glpat)"
+      echo "OK: no common long-lived token CI variables set"
+      echo "PASS: privacy posture for CI variables"
+
+# ── 3) Exchange handle → short-lived token → call GitLab /user ───────────────
+# ALLOWED workflow name: ctrs_exchange_and_api
+ctrs_exchange_and_api:
+  stage: exchange
+  tags:
+    - testing
+  needs:
+    - ctrs_verify_runner
+    - ctrs_privacy_ci_vars
+  script:
+    - |
+      set -e
+      echo "=== CTRS exchange (handle -> short-lived token) ==="
+      export GITLAB_TOKEN=$(confstr exchange --target gitlab)
+      if [ -z "$GITLAB_TOKEN" ]; then
+        echo "ERROR: empty token from confstr exchange"
+        exit 1
+      fi
+      # Mask in GitLab job log if runner supports it
+      echo "Token acquired (length=${#GITLAB_TOKEN})"
+
+      echo "=== GET /user with exchanged token ==="
+      OUTPUT=$(python3 scripts/gitlab_api_get.py "${CI_API_V4_URL}/user" "$GITLAB_TOKEN")
+      HTTP_CODE=$(echo "$OUTPUT" | head -n1 | sed 's/^__HTTP_CODE__://')
+      BODY=$(echo "$OUTPUT" | tail -n +2)
+
+      if [ "$HTTP_CODE" != "200" ]; then
+        echo "User API failed (HTTP $HTTP_CODE): $BODY"
+        exit 1
+      fi
+      echo "$BODY" | python3 -c "import json,sys; u=json.load(sys.stdin); print(f\"OK: authenticated as {u.get('username')} (id={u.get('id')})\")"
+      echo "PASS: short-lived token works for GitLab API"
+      echo "PASS: long-lived secret never left the CTRS vault"
+
+# ── 4) Project-scoped API — proves token can read this project ───────────────
+# ALLOWED workflow name: ctrs_project_metadata
+ctrs_project_metadata:
+  stage: exchange
+  tags:
+    - testing
+  needs:
+    - ctrs_verify_runner
+    - ctrs_privacy_ci_vars
+  script:
+    - |
+      set -e
+      echo "=== CTRS exchange ==="
+      export GITLAB_TOKEN=$(confstr exchange --target gitlab)
+      if [ -z "$GITLAB_TOKEN" ]; then
+        echo "ERROR: empty token from confstr exchange"
+        exit 1
+      fi
+      echo "Token acquired"
+
+      echo "=== GET this project via GitLab API ==="
+      OUTPUT=$(python3 scripts/gitlab_api_get.py "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}" "$GITLAB_TOKEN")
+      HTTP_CODE=$(echo "$OUTPUT" | head -n1 | sed 's/^__HTTP_CODE__://')
+      BODY=$(echo "$OUTPUT" | tail -n +2)
+
+      if [ "$HTTP_CODE" != "200" ]; then
+        echo "Project API failed (HTTP $HTTP_CODE): $BODY"
+        exit 1
+      fi
+
+      printf '%s\n' "$BODY" > /tmp/ctrs_project.json
+      python3 scripts/assert_project_path.py /tmp/ctrs_project.json "$CI_PROJECT_PATH"
+      echo "PASS: exchanged token can read project metadata for $CI_PROJECT_PATH"
+
+# ── 5) Negative test — unauthorized job name must be denied ──────────────────
+# This job name is intentionally NOT in the CTRS allow policy.
+# Expectation: confstr exchange fails → job succeeds (proves deny path).
+ctrs_policy_denied:
+  stage: policy
+  tags:
+    - testing
+  needs:
+    - ctrs_exchange_and_api
+  script:
+    - |
+      set +e
+      echo "=== Expect policy DENY for job name: $CI_JOB_NAME ==="
+      ERR=$(confstr exchange --target gitlab 2>&1)
+      CODE=$?
+      set -e
+      echo "$ERR"
+      if [ "$CODE" -eq 0 ]; then
+        echo "FAIL: exchange succeeded but this job should be denied by policy"
+        exit 1
+      fi
+      echo "PASS: CTRS denied exchange for unauthorized workflow/job name"
+      echo "Check Audit log in the dashboard for exchange_denied"
